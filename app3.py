@@ -1,3 +1,5 @@
+import json
+import os
 import subprocess
 import sys
 
@@ -76,21 +78,33 @@ def _breakdown(cost, names):
     return out
 
 
+RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "co2_runner.py")
+RESULT_TAG = "__CO2_RUNNER_RESULT__"
+
+
+def _call_runner(task, args=None):
+    """Runs co2_runner.py in a fresh Python process (see that file for why)
+    and returns its JSON result."""
+    proc = subprocess.run([sys.executable, RUNNER, task], input=json.dumps(args or {}),
+                          capture_output=True, text=True, cwd=os.path.dirname(RUNNER))
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith(RESULT_TAG):
+            return json.loads(line[len(RESULT_TAG):])
+    raise RuntimeError("The cycle process stopped unexpectedly:\n" + (proc.stderr or proc.stdout)[-1500:])
+
+
+def _solve_in_runner(task, args):
+    out = _call_runner(task, args)
+    if "error" in out:
+        raise RuntimeError(out["error"])  # raised, not returned, so failures are not cached
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def run_super(flue, approach, p1, bypass, htr_eff, ltr_eff, drop_hot, drop_cold, bc, cooler):
-    import super as sup
-    cyc = sup.sco2(approach, p1, bypass, htr_eff, ltr_eff, np.array(drop_hot), np.array(drop_cold),
-                   list(flue), list(bc), list(cooler))
-    (en, exg, net, f_out, turb_c, mc_c, bc_c, _, hx_costs, fluid_c, total) = cyc.calc()
-    costs = {
-        "Turbine": turb_c, "Main compressor": mc_c, "Bypass compressor": bc_c,
-        "HTR": hx_costs["htr"]["cost"], "LTR": hx_costs["ltr"]["cost"],
-        "Bottoming-cycle HX": hx_costs["bt"]["cost"], "Cooler": hx_costs["condenser"]["cost"],
-        "Flue gas heater": hx_costs["heater"]["cost"], "Cooling tower": hx_costs["cooling_tower"]["cost"],
-        "CO₂ charge": fluid_c,
-    }
-    return dict(energy=en, exergy=100 * exg, output=net, heat_in=cyc.heat_input,
-                t_out=f_out[0], total=total, costs=costs)
+    return _solve_in_runner("super", dict(flue=flue, approach=approach, p1=p1, bypass=bypass,
+                                          htr_eff=htr_eff, ltr_eff=ltr_eff, drop_hot=drop_hot,
+                                          drop_cold=drop_cold, bc=bc, cooler=cooler))
 
 
 @st.cache_data(show_spinner=False)
@@ -132,14 +146,8 @@ def run_orc(t_in, p_in, m_flue, fs, turb_eff, pump_eff, losses):
 
 @st.cache_data(show_spinner=False)
 def run_trans(t_in, p_in, m_flue, fs, turb_eff, pump_eff, heater_eff, losses):
-    import trans
-    cyc = trans.tco2(t_in, p_in, m_flue, fs, turb_eff, pump_eff, heater_eff, tuple(losses))
-    en, exg, net, f_out, cost = cyc.calc()
-    return dict(energy=en, exergy=exg, output=net, heat_in=cyc.hx_heater,
-                t_out=f_out[0], total=cost["total"],
-                costs={"Turbine": cost["turbine_cost"], "Pump": cost["pump_cost"],
-                       "Heater": cost["heater_cost"], "Condenser": cost["condenser_cost"],
-                       "Cooling tower": cost["cooling_tower_cost"], "CO₂ charge": cost["co2_fluid_cost"]})
+    return _solve_in_runner("trans", dict(t_in=t_in, p_in=p_in, m_flue=m_flue, fs=fs, turb_eff=turb_eff,
+                                          pump_eff=pump_eff, heater_eff=heater_eff, losses=losses))
 
 
 def run(key, fn, *args):
@@ -176,50 +184,34 @@ def show_results(key, cooling=False):
             st.write(f"**{name}:** " + ("N/A" if v is None else f"₹ {v:,.0f}"))
 
 
-def idaes_status():
-    """True when IDAES and its compiled add-ons (Helmholtz EoS for CO2/water,
-    cubic-root functions for the Peng-Robinson flue gas, Ipopt) are usable.
-    Returns (ok, message)."""
-    try:
-        import idaes
-        from idaes.models.properties.general_helmholtz import helmholtz_available
-        from idaes.models.properties.modular_properties.eos.ceos import cubic_roots_available
-        from pyomo.environ import SolverFactory
-    except ImportError as err:
-        return False, f"IDAES is not installed in this Python environment ({err})."
-    missing = []
-    if not helmholtz_available():
-        missing.append("Helmholtz EoS functions (CO₂ / water properties)")
-    if not cubic_roots_available():
-        missing.append("cubic-root functions (Peng-Robinson flue gas)")
-    if not SolverFactory("ipopt").available(exception_flag=False):
-        missing.append("Ipopt solver")
-    if missing:
-        return False, ("IDAES is installed, but its add-ons are missing: " + ", ".join(missing)
-                       + f". They are looked for in `{idaes.bin_directory}`.")
-    return True, ""
-
-
 def idaes_check(tab_key):
-    """Shows a warning plus a one-click installer if IDAES add-ons are missing.
-    Returns True when the cycle can run."""
-    ok, msg = idaes_status()
-    if ok:
+    """Shows a warning plus a one-click installer if the IDAES add-ons needed
+    by the CO2 cycles are missing. Returns True when the cycle can run.
+    The check runs once per browser session and again after an install."""
+    if "idaes_status" not in st.session_state:
+        with st.spinner("Checking IDAES installation…"):
+            try:
+                st.session_state["idaes_status"] = _call_runner("status")
+            except RuntimeError as err:
+                st.session_state["idaes_status"] = {"ok": False, "message": str(err)}
+    status = st.session_state["idaes_status"]
+    if status["ok"]:
+        if st.session_state.pop(f"installed_{tab_key}", False):
+            st.success("IDAES add-ons installed. You can run this cycle now.")
         return True
-    st.warning(msg + "\n\nThis cycle needs them. Click below to download them into the same "
-               "Python environment that is running this app (about 100 MB, needs internet). "
-               "Or run this in a terminal:\n\n"
-               f'`"{sys.executable}" -m pip install idaes-pse` then `idaes get-extensions`')
+    st.warning(status["message"] + "\n\nThis cycle needs them. Click below to download them into the "
+               "same Python environment that is running this app (about 100 MB, needs internet).")
     if st.button("Install IDAES add-ons", key=f"install_{tab_key}"):
-        with st.spinner("Downloading IDAES add-ons…"):
+        with st.spinner("Downloading IDAES add-ons… this can take a few minutes"):
             proc = subprocess.run(
                 [sys.executable, "-c",
                  "import sys; sys.argv=['idaes','get-extensions']; "
                  "from idaes.commands.base import command_base; command_base()"],
                 capture_output=True, text=True)
         if proc.returncode == 0:
-            st.success("Installed. Stop the app (Ctrl+C in its terminal) and start it again "
-                       "with `streamlit run app.py`, then run this cycle.")
+            st.session_state.pop("idaes_status", None)  # re-check on the next run
+            st.session_state[f"installed_{tab_key}"] = True
+            st.rerun()
         else:
             st.error("Install failed:\n\n```\n" + (proc.stderr or proc.stdout)[-2000:] + "\n```")
     return False
