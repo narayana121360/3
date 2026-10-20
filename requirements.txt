@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+scipy
+sympy
+matplotlib
+plotly
+CoolProp
+idaes-pse
+# After installing, run once to download the Ipopt solver used by IDAES:
+#   idaes get-extensions
