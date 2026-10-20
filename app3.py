@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import numpy as np
 import streamlit as st
 
@@ -173,6 +176,55 @@ def show_results(key, cooling=False):
             st.write(f"**{name}:** " + ("N/A" if v is None else f"₹ {v:,.0f}"))
 
 
+def idaes_status():
+    """True when IDAES and its compiled add-ons (Helmholtz EoS for CO2/water,
+    cubic-root functions for the Peng-Robinson flue gas, Ipopt) are usable.
+    Returns (ok, message)."""
+    try:
+        import idaes
+        from idaes.models.properties.general_helmholtz import helmholtz_available
+        from idaes.models.properties.modular_properties.eos.ceos import cubic_roots_available
+        from pyomo.environ import SolverFactory
+    except ImportError as err:
+        return False, f"IDAES is not installed in this Python environment ({err})."
+    missing = []
+    if not helmholtz_available():
+        missing.append("Helmholtz EoS functions (CO₂ / water properties)")
+    if not cubic_roots_available():
+        missing.append("cubic-root functions (Peng-Robinson flue gas)")
+    if not SolverFactory("ipopt").available(exception_flag=False):
+        missing.append("Ipopt solver")
+    if missing:
+        return False, ("IDAES is installed, but its add-ons are missing: " + ", ".join(missing)
+                       + f". They are looked for in `{idaes.bin_directory}`.")
+    return True, ""
+
+
+def idaes_check(tab_key):
+    """Shows a warning plus a one-click installer if IDAES add-ons are missing.
+    Returns True when the cycle can run."""
+    ok, msg = idaes_status()
+    if ok:
+        return True
+    st.warning(msg + "\n\nThis cycle needs them. Click below to download them into the same "
+               "Python environment that is running this app (about 100 MB, needs internet). "
+               "Or run this in a terminal:\n\n"
+               f'`"{sys.executable}" -m pip install idaes-pse` then `idaes get-extensions`')
+    if st.button("Install IDAES add-ons", key=f"install_{tab_key}"):
+        with st.spinner("Downloading IDAES add-ons…"):
+            proc = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.argv=['idaes','get-extensions']; "
+                 "from idaes.commands.base import command_base; command_base()"],
+                capture_output=True, text=True)
+        if proc.returncode == 0:
+            st.success("Installed. Stop the app (Ctrl+C in its terminal) and start it again "
+                       "with `streamlit run app.py`, then run this cycle.")
+        else:
+            st.error("Install failed:\n\n```\n" + (proc.stderr or proc.stdout)[-2000:] + "\n```")
+    return False
+
+
 def drop(label, default, key):
     """Pressure-drop input in bar, returned in Pa."""
     return st.number_input(f"{label} (bar)", min_value=0.0, value=default, step=0.1, format="%.2f", key=key) * BAR
@@ -190,6 +242,7 @@ tabs = st.tabs(["Supercritical CO₂", "Steam Rankine", "LiBr Absorption", "Orga
 with tabs[0]:
     st.caption("Recompression sCO₂ Brayton cycle. The flue gas enters at the SOFC flue gas "
                "temperature and pressure set in the sidebar.")
+    super_ready = idaes_check("super")
     with st.form("super"):
         a, b, cc = st.columns(3)
         approach = a.number_input("Flue Gas HX Approach (K)", min_value=1.0, value=20.0, step=1.0)
@@ -217,7 +270,7 @@ with tabs[0]:
                 cold = [drop("HTR", 6.0, "sc1"), drop("LTR", 5.0, "sc2"), drop("Bottoming-cycle HX", 4.0, "sc3"),
                         drop("Cooler", 1.0, "sc4"), 0.0, drop("Flue gas HX, CO₂ side", 0.2, "sc6")]
         go = st.form_submit_button("Run Supercritical CO₂ Cycle", type="primary")
-    if go:
+    if go and super_ready:
         run("res_super", run_super, (t_c + K, p_bar * BAR, mass_flow, flue_string), approach, p1 * BAR,
             bypass, htr, ltr, tuple(hot), tuple(cold), (t_bc + K, p_bc * BAR, m_bc, "CO2"),
             (t_cw + K, p_cw * BAR, "IF97::Water"))
@@ -300,6 +353,7 @@ with tabs[3]:
 # ---------------- Transcritical CO2 ----------------
 with tabs[4]:
     st.caption("Transcritical CO₂ Rankine cycle.")
+    trans_ready = idaes_check("trans")
     with st.form("trans"):
         a, b = st.columns(2)
         t_in = a.number_input("Flue Gas Inlet Temperature (°C)", min_value=60.0, value=700.0, step=10.0, key="tr_t")
@@ -317,6 +371,6 @@ with tabs[4]:
                 l2 = drop("Condenser, cooling water side", 0.0, "tr_l2")
                 l4 = drop("Heater, CO₂ side", 0.0, "tr_l4")
         go = st.form_submit_button("Run Transcritical CO₂ Cycle", type="primary")
-    if go:
+    if go and trans_ready:
         run("res_trans", run_trans, t_in + K, p_in * BAR, mass_flow, flue_string, te, pe, he, (l1, l2, l3, l4))
     show_results("res_trans")
